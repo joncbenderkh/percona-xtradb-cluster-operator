@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -14,13 +15,22 @@ import (
 	certmgrscheme "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned/scheme"
 	"github.com/go-logr/logr"
 	"github.com/kelseyhightower/envconfig"
+	"github.com/pkg/errors"
 	uzap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -46,6 +56,12 @@ var (
 	scheme    = k8sruntime.NewScheme()
 	setupLog  = ctrl.Log.WithName("setup")
 )
+
+// The cache checks its per-object settings against the scheme when the
+// manager is created, so the types must be registered before that.
+func init() {
+	utilruntime.Must(addToScheme(scheme))
+}
 
 func main() {
 	var metricsAddr string
@@ -135,13 +151,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Add support for MultiNamespace set in WATCH_NAMESPACE
-	if len(namespace) > 0 {
-		namespaces := make(map[string]cache.Config)
-		for _, ns := range append(strings.Split(namespace, ","), operatorNamespace) {
-			namespaces[ns] = cache.Config{}
-		}
-		options.Cache.DefaultNamespaces = namespaces
+	err = configureCache(&options, namespace, operatorNamespace, envs.SecretCacheExcludedTypes)
+	if err != nil {
+		setupLog.Error(err, "failed to configure cache")
+		os.Exit(1)
 	}
 
 	// Get a config to talk to the apiserver
@@ -158,24 +171,6 @@ func main() {
 	}
 
 	setupLog.Info("Registering Components.")
-
-	// Setup Scheme for k8s resources
-	if err := clientgoscheme.AddToScheme(mgr.GetScheme()); err != nil {
-		setupLog.Error(err, "")
-		os.Exit(1)
-	}
-
-	// Setup Scheme for PXC resources
-	if err := apis.AddToScheme(mgr.GetScheme()); err != nil {
-		setupLog.Error(err, "")
-		os.Exit(1)
-	}
-
-	// Setup Scheme for cert-manager resources
-	if err := certmgrscheme.AddToScheme(mgr.GetScheme()); err != nil {
-		setupLog.Error(err, "")
-		os.Exit(1)
-	}
 
 	ctx := k8s.StartStopSignalHandler(mgr.GetClient(), strings.Split(namespace, ","))
 	// Setup all Controllers
@@ -273,6 +268,8 @@ type envConfig struct {
 	FeatureGates string `envconfig:"PXCO_FEATURE_GATES"`
 
 	Workers *int `envconfig:"MAX_CONCURRENT_RECONCILES"`
+
+	SecretCacheExcludedTypes string `envconfig:"PXCO_SECRET_CACHE_EXCLUDED_TYPES"`
 }
 
 func configureLeaderElection(options *ctrl.Options, envs *envConfig, operatorNamespace string) error {
@@ -294,6 +291,175 @@ func configureLeaderElection(options *ctrl.Options, envs *envConfig, operatorNam
 	}
 
 	return nil
+}
+
+// addToScheme registers the Kubernetes, PXC and cert-manager types the
+// operator uses.
+func addToScheme(s *k8sruntime.Scheme) error {
+	for _, add := range []func(*k8sruntime.Scheme) error{
+		clientgoscheme.AddToScheme,
+		apis.AddToScheme,
+		certmgrscheme.AddToScheme,
+	} {
+		if err := add(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// operatorSecretTypes are the types of the Secrets the operator creates.
+// Excluding them from the cache would make those Secrets look missing.
+var operatorSecretTypes = map[corev1.SecretType]bool{
+	corev1.SecretTypeOpaque: true,
+	corev1.SecretTypeTLS:    true,
+}
+
+// configureCache limits the informer cache to the namespaces in
+// WATCH_NAMESPACE, if set, and keeps Secrets of the types in
+// PXCO_SECRET_CACHE_EXCLUDED_TYPES out of it. The PXC controller watches
+// Secrets cluster-wide in cluster-wide mode, so without this the operator's
+// memory grows with every Secret in the cluster, such as Helm release
+// revisions (type helm.sh/release.v1), instead of with the Secrets it manages.
+// excludedTypes is a comma-separated list of Secret types, for example
+// "helm.sh/release.v1"; empty, the default, caches every Secret.
+//
+// The operator also reads Secrets that users reference by name, whatever
+// their type. When types are excluded, the cache also holds the metadata of
+// the Secrets of those types, so that it reports a referenced Secret of an
+// excluded type as an error instead of NotFound.
+func configureCache(options *ctrl.Options, watchNamespace, operatorNamespace, excludedTypes string) error {
+	// Add support for MultiNamespace set in WATCH_NAMESPACE
+	if len(watchNamespace) > 0 {
+		namespaces := make(map[string]cache.Config)
+		for _, ns := range append(strings.Split(watchNamespace, ","), operatorNamespace) {
+			namespaces[ns] = cache.Config{}
+		}
+		options.Cache.DefaultNamespaces = namespaces
+	}
+
+	if strings.TrimSpace(excludedTypes) == "" {
+		return nil
+	}
+	var excluded []corev1.SecretType
+	var selectors []fields.Selector
+	for _, entry := range strings.Split(excludedTypes, ",") {
+		secretType := corev1.SecretType(strings.TrimSpace(entry))
+		switch {
+		case secretType == "" || strings.ContainsAny(string(secretType), " \t=!"):
+			return errors.Errorf("value for PXCO_SECRET_CACHE_EXCLUDED_TYPES is invalid: %q is not a Secret type", entry)
+		case operatorSecretTypes[secretType]:
+			return errors.Errorf("value for PXCO_SECRET_CACHE_EXCLUDED_TYPES is invalid: the operator creates Secrets of type %q", secretType)
+		case slices.Contains(excluded, secretType):
+			continue
+		}
+		excluded = append(excluded, secretType)
+		selectors = append(selectors, fields.OneTermNotEqualSelector("type", string(secretType)))
+	}
+
+	if options.Cache.ByObject == nil {
+		options.Cache.ByObject = map[client.Object]cache.ByObject{}
+	}
+	options.Cache.ByObject[&corev1.Secret{}] = cache.ByObject{Field: fields.AndSelectors(selectors...)}
+	options.NewCache = newExcludedSecretTypesCache(excluded)
+	setupLog.Info("Secret types excluded from the cache", "types", excluded)
+	return nil
+}
+
+// excludedSecretTypesCache explains cache misses caused by
+// PXCO_SECRET_CACHE_EXCLUDED_TYPES. Next to the main cache it keeps one
+// metadata-only cache per excluded type. When the main cache has no Secret
+// for a key and the metadata cache of an excluded type has one, Get returns
+// an error naming the setting instead of NotFound, without an API request.
+type excludedSecretTypesCache struct {
+	cache.Cache
+	excluded map[corev1.SecretType]cache.Cache
+}
+
+func newExcludedSecretTypesCache(excludedTypes []corev1.SecretType) cache.NewCacheFunc {
+	return func(config *rest.Config, options cache.Options) (cache.Cache, error) {
+		mainCache, err := cache.New(config, options)
+		if err != nil {
+			return nil, err
+		}
+
+		excluded := make(map[corev1.SecretType]cache.Cache, len(excludedTypes))
+		for _, secretType := range excludedTypes {
+			metadataCache, err := cache.New(config, cache.Options{
+				HTTPClient:           options.HTTPClient,
+				Scheme:               options.Scheme,
+				Mapper:               options.Mapper,
+				DefaultNamespaces:    options.DefaultNamespaces,
+				DefaultFieldSelector: fields.OneTermEqualSelector("type", string(secretType)),
+				DefaultTransform:     keepNameOnly,
+			})
+			if err != nil {
+				return nil, errors.Wrapf(err, "create metadata cache for Secret type %q", secretType)
+			}
+			// Register the informer now so that WaitForCacheSync waits for it.
+			if _, err := metadataCache.GetInformer(context.Background(), secretMetadata(), cache.BlockUntilSynced(false)); err != nil {
+				return nil, errors.Wrapf(err, "create metadata informer for Secret type %q", secretType)
+			}
+			excluded[secretType] = metadataCache
+		}
+		return &excludedSecretTypesCache{Cache: mainCache, excluded: excluded}, nil
+	}
+}
+
+// keepNameOnly drops the metadata the existence check does not need.
+// Annotations can be large: kubectl's last-applied-configuration holds the
+// whole Secret, data included.
+func keepNameOnly(in any) (any, error) {
+	if obj, err := meta.Accessor(in); err == nil {
+		obj.SetAnnotations(nil)
+		obj.SetLabels(nil)
+		obj.SetManagedFields(nil)
+		obj.SetOwnerReferences(nil)
+		obj.SetFinalizers(nil)
+	}
+	return in, nil
+}
+
+func secretMetadata() *metav1.PartialObjectMetadata {
+	secret := &metav1.PartialObjectMetadata{}
+	secret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+	return secret
+}
+
+func (c *excludedSecretTypesCache) Start(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return c.Cache.Start(ctx) })
+	for _, metadataCache := range c.excluded {
+		g.Go(func() error { return metadataCache.Start(ctx) })
+	}
+	return g.Wait()
+}
+
+func (c *excludedSecretTypesCache) WaitForCacheSync(ctx context.Context) bool {
+	for _, metadataCache := range c.excluded {
+		if !metadataCache.WaitForCacheSync(ctx) {
+			return false
+		}
+	}
+	return c.Cache.WaitForCacheSync(ctx)
+}
+
+func (c *excludedSecretTypesCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Cache.Get(ctx, key, obj, opts...)
+	if _, isSecret := obj.(*corev1.Secret); !isSecret || !k8serrors.IsNotFound(err) {
+		return err
+	}
+
+	for secretType, metadataCache := range c.excluded {
+		metadataErr := metadataCache.Get(ctx, key, secretMetadata())
+		switch {
+		case metadataErr == nil:
+			return errors.Errorf("secret %s has type %q, which PXCO_SECRET_CACHE_EXCLUDED_TYPES keeps out of the operator's cache: remove the type from the list", key, secretType)
+		case !k8serrors.IsNotFound(metadataErr):
+			return errors.Wrapf(metadataErr, "check whether secret %s has type %q", key, secretType)
+		}
+	}
+	return err
 }
 
 func configureGroupKindConcurrency(options *ctrl.Options, envs *envConfig) error {
