@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -84,6 +85,7 @@ func reconciler() *ReconcilePerconaXtraDBCluster {
 		crons:     NewCronRegistry(),
 		lockers:   newLockStore(),
 		clientcmd: cli,
+		recorder:  &record.FakeRecorder{},
 		serverVersion: &version.ServerVersion{
 			Platform: version.PlatformKubernetes,
 		},

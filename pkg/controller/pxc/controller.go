@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -289,6 +290,11 @@ func (r *ReconcilePerconaXtraDBCluster) Reconcile(ctx context.Context, request r
 			switch fnlz {
 			case naming.FinalizerDeleteSSL:
 				err = r.deleteCerts(ctx, o)
+				if err != nil {
+					log.Error(err, "delete TLS objects, keeping finalizer", "finalizer", fnlz)
+					r.recorder.Event(o, corev1.EventTypeWarning, naming.EventDeleteSSLFailed,
+						fmt.Sprintf("keeping finalizer %s: %v", fnlz, err))
+				}
 			case naming.FinalizerDeleteProxysqlPvc:
 				sfs = statefulset.NewProxy(o)
 				// deletePVC is always true on this stage
@@ -779,7 +785,25 @@ func (r *ReconcilePerconaXtraDBCluster) deleteSecrets(ctx context.Context, cr *a
 	return nil
 }
 
+// isAbsent reports whether a read failed because the object does not exist,
+// or because its API is not installed, as cert-manager's is not on clusters
+// without it. After any other error the object may still exist.
+func isAbsent(err error) bool {
+	return k8serrors.IsNotFound(err) || meta.IsNoMatchError(err)
+}
+
+// deleteCerts deletes the cluster's cert-manager Issuers and Certificates
+// and its TLS Secrets. The objects that can be read are deleted, and the
+// first read error is returned so that the delete-ssl finalizer stays for
+// the rest.
 func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api.PerconaXtraDBCluster) error {
+	var readErr error
+	keepReadError := func(err error, kind, name string) {
+		if readErr == nil {
+			readErr = errors.Wrapf(err, "get %s %s", kind, name)
+		}
+	}
+
 	issuers := []string{
 		naming.CAIssuerName(cr),
 		naming.IssuerName(cr),
@@ -787,7 +811,11 @@ func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api
 	for _, issuerName := range issuers {
 		issuer := &cm.Issuer{}
 		err := r.client.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: issuerName}, issuer)
+		if isAbsent(err) {
+			continue
+		}
 		if err != nil {
+			keepReadError(err, "issuer", issuerName)
 			continue
 		}
 
@@ -802,10 +830,17 @@ func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api
 		naming.SSLInternalCertificateName(cr),
 		naming.CACertificateName(cr),
 	}
+	var certReadErr error
 	for _, certName := range certs {
 		cert := &cm.Certificate{}
 		err := r.client.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: certName}, cert)
+		if isAbsent(err) {
+			continue
+		}
 		if err != nil {
+			if certReadErr == nil {
+				certReadErr = errors.Wrapf(err, "get certificate %s", certName)
+			}
 			continue
 		}
 
@@ -813,6 +848,12 @@ func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api
 		if err != nil {
 			return errors.Wrapf(err, "delete certificate %s", certName)
 		}
+	}
+
+	// cert-manager issues the Secrets of the Certificates again, so delete
+	// them only once the Certificates are known to be gone.
+	if certReadErr != nil {
+		return certReadErr
 	}
 
 	secrets := []string{
@@ -834,7 +875,11 @@ func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api
 	for _, secretName := range secrets {
 		secret := &corev1.Secret{}
 		err := r.client.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: secretName}, secret)
+		if isAbsent(err) {
+			continue
+		}
 		if err != nil {
+			keepReadError(err, "secret", secretName)
 			continue
 		}
 
@@ -844,7 +889,7 @@ func (r *ReconcilePerconaXtraDBCluster) deleteCerts(ctx context.Context, cr *api
 		}
 	}
 
-	return nil
+	return readErr
 }
 
 // resyncPXCUsersWithProxySQL calls the method of synchronizing users and makes sure that only one Goroutine works at a time

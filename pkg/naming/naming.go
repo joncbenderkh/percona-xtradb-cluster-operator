@@ -24,6 +24,7 @@ const (
 	EventStorageClassNotSupportResize = "StorageClassNotSupportResize"
 	EventExceededQuota                = "ExceededQuota"
 	EventPVCStorageSizeMismatch       = "PVCStorageSizeMismatch"
+	EventDeleteSSLFailed              = "DeleteSSLFailed"
 )
 
 const (
